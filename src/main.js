@@ -53,6 +53,15 @@ routePromise
     let profileTouchScrubbingDayId = null;
     let profileLongPressTimer = null;
     let profileLongPressStart = null;
+    let suppressProfileTapUntil = 0;
+    let pendingMobileRouteTap = null;
+    const mobileTapFriendlyRoutes = isTouchDevice();
+
+    function handleRouteSelection(feature) {
+      if (feature.properties.dayId !== state.activeDayId) {
+        setActiveDay(feature.properties.dayId);
+      }
+    }
 
     const routeLayer = L.geoJSON(routeGeoJson, {
       style: (feature) => routeStyle(feature, state),
@@ -62,12 +71,21 @@ routePromise
         }
         routeLayersByDay.get(feature.properties.dayId).push(layer);
         layer.on("click", () => {
-          if (feature.properties.dayId !== state.activeDayId) {
-            setActiveDay(feature.properties.dayId);
-          }
+          handleRouteSelection(feature);
         });
       }
     }).addTo(map);
+
+    if (mobileTapFriendlyRoutes) {
+      L.geoJSON(routeGeoJson, {
+        style: (feature) => routeHitStyle(feature),
+        onEachFeature: (feature, layer) => {
+          layer.on("click", () => {
+            handleRouteSelection(feature);
+          });
+        }
+      }).addTo(map);
+    }
 
     mapPlaceFeatures.forEach((feature) => {
       const marker = buildMarker(feature);
@@ -115,6 +133,16 @@ routePromise
           return;
         }
 
+        const otherDayTapTarget = findClosestRouteDay(latlng, map, 36, state.activeDayId);
+        if (otherDayTapTarget) {
+          pendingMobileRouteTap = {
+            dayId: otherDayTapTarget.dayId,
+            clientX: event.touches[0].clientX,
+            clientY: event.touches[0].clientY
+          };
+          return;
+        }
+
         const interaction = dayInteractionData.get(state.activeDayId);
         const routePoint = interaction ? projectLatLngToRouteSample(interaction, latlng, map, 34) : null;
         if (!routePoint) {
@@ -132,6 +160,17 @@ routePromise
     mapContainer.addEventListener(
       "touchmove",
       (event) => {
+        if (pendingMobileRouteTap && event.touches.length === 1) {
+          const touch = event.touches[0];
+          const movedTooFar =
+            Math.abs(touch.clientX - pendingMobileRouteTap.clientX) > 12 ||
+            Math.abs(touch.clientY - pendingMobileRouteTap.clientY) > 12;
+
+          if (movedTooFar) {
+            pendingMobileRouteTap = null;
+          }
+        }
+
         if (!touchRouteScrubbingDayId || event.touches.length !== 1) {
           return;
         }
@@ -148,6 +187,13 @@ routePromise
     );
 
     const stopTouchRouteScrub = () => {
+      if (pendingMobileRouteTap?.dayId) {
+        const nextDayId = pendingMobileRouteTap.dayId;
+        pendingMobileRouteTap = null;
+        setActiveDay(nextDayId);
+        return;
+      }
+
       if (!touchRouteScrubbingDayId) {
         return;
       }
@@ -228,6 +274,7 @@ routePromise
       touchRouteScrubbingDayId = null;
       profileTouchScrubbingDayId = null;
       profileLongPressStart = null;
+      pendingMobileRouteTap = null;
       if (!map.dragging.enabled()) {
         map.dragging.enable();
       }
@@ -280,7 +327,9 @@ routePromise
 
         chart.addEventListener("click", (event) => {
           if (isTouchDevice()) {
-            event.stopPropagation();
+            if (Date.now() < suppressProfileTapUntil) {
+              event.stopPropagation();
+            }
             return;
           }
           if (state.activeDayId !== dayId) {
@@ -314,6 +363,7 @@ routePromise
                 return;
               }
               profileTouchScrubbingDayId = dayId;
+              suppressProfileTapUntil = Date.now() + 350;
               updatePreviewFromProfile(dayId, profileDistanceFromTouch(chart, profileLongPressStart));
             }, 280);
           },
@@ -366,6 +416,7 @@ routePromise
             return;
           }
           profileTouchScrubbingDayId = null;
+          suppressProfileTapUntil = Date.now() + 350;
           event.preventDefault();
           event.stopPropagation();
           clearPreview();
@@ -465,13 +516,37 @@ routePromise
       previewMarker.bringToFront();
     }
 
-    function fitOverview() {
-      fitBoundsWithUI(map, allBounds, "overview");
+    function findClosestRouteDay(latlng, mapInstance, maxPixelDistance, excludedDayId = null) {
+      let best = null;
+
+      for (const [dayId, interaction] of dayInteractionData.entries()) {
+        if (dayId === excludedDayId) {
+          continue;
+        }
+
+        const routePoint = projectLatLngToRouteSample(interaction, latlng, mapInstance, maxPixelDistance);
+        if (!routePoint) {
+          continue;
+        }
+
+        if (!best || routePoint.distanceSq < best.distanceSq) {
+          best = {
+            dayId,
+            distanceSq: routePoint.distanceSq
+          };
+        }
+      }
+
+      return best;
     }
 
-    function fitDay(dayId) {
+    function fitOverview(options = {}) {
+      fitBoundsWithUI(map, allBounds, "overview", options);
+    }
+
+    function fitDay(dayId, options = {}) {
       const bounds = L.featureGroup(routeLayersByDay.get(dayId) || []).getBounds();
-      fitBoundsWithUI(map, bounds, dayId === "day4" ? "day-tight" : "day");
+      fitBoundsWithUI(map, bounds, dayId === "day4" ? "day-tight" : "day", options);
     }
 
     function scrollToCard(index) {
@@ -509,15 +584,27 @@ routePromise
       fitDay(dayId);
     }
 
-    function resetOverview() {
-      suppressAutoSelectUntil = Date.now() + 1200;
+    function restoreOverview({ animate = true, scrollCarousel = true, suppressScrollSelection = true } = {}) {
+      if (suppressScrollSelection) {
+        suppressAutoSelectUntil = Date.now() + 1200;
+      }
       clearPreview();
       state.activeDayId = null;
       syncCarouselState();
       refreshRoutes();
       refreshMarkers();
-      scrollToCard(0);
-      fitOverview();
+      if (scrollCarousel) {
+        scrollToCard(0);
+      }
+      fitOverview({ animate });
+    }
+
+    function resetOverview() {
+      restoreOverview({
+        animate: true,
+        scrollCarousel: true,
+        suppressScrollSelection: true
+      });
     }
 
     function detectCenteredCardFromScroll() {
@@ -527,11 +614,11 @@ routePromise
 
       if (carousel.scrollLeft < 56) {
         if (state.activeDayId !== null) {
-          clearPreview();
-          state.activeDayId = null;
-          syncCarouselState();
-          refreshRoutes();
-          refreshMarkers();
+          restoreOverview({
+            animate: true,
+            scrollCarousel: false,
+            suppressScrollSelection: false
+          });
         }
         return;
       }
@@ -557,19 +644,22 @@ routePromise
 
       if (!nearest || nearest.distance > nearest.width * 0.28) {
         if (carousel.scrollLeft < 24 && state.activeDayId !== null) {
-          clearPreview();
-          state.activeDayId = null;
-          syncCarouselState();
-          refreshRoutes();
-          refreshMarkers();
-          fitOverview();
+          restoreOverview({
+            animate: true,
+            scrollCarousel: false,
+            suppressScrollSelection: false
+          });
         }
         return;
       }
 
       if (nearest.index === 0) {
         if (state.activeDayId !== null) {
-          resetOverview();
+          restoreOverview({
+            animate: true,
+            scrollCarousel: false,
+            suppressScrollSelection: false
+          });
         }
         return;
       }
@@ -627,9 +717,9 @@ routePromise
 
     window.addEventListener("resize", () => {
       if (state.activeDayId) {
-        fitDay(state.activeDayId);
+        fitDay(state.activeDayId, { animate: false });
       } else {
-        fitOverview();
+        fitOverview({ animate: false });
       }
     });
 
@@ -637,7 +727,7 @@ routePromise
     syncCarouselState();
     refreshRoutes();
     refreshMarkers();
-    fitOverview();
+    fitOverview({ animate: false });
   })
   .catch((error) => {
     document.querySelector("#app").innerHTML = `
@@ -659,6 +749,12 @@ function renderLayout(meta) {
         <div class="floating-header__eyebrow">GR11 · GR92</div>
         <h1>Núria → Cap de Creus</h1>
         <p data-compact-summary>${meta.summary.days} etapes · ${Math.round(totalDistance)} km · ${formatOverviewGain(totalGain)}</p>
+        <div class="floating-header__signature" aria-label="GitHub signature">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path d="M12 2C6.48 2 2 6.58 2 12.23c0 4.52 2.87 8.35 6.84 9.7.5.1.68-.22.68-.49 0-.24-.01-1.05-.01-1.9-2.78.62-3.37-1.21-3.37-1.21-.46-1.19-1.11-1.5-1.11-1.5-.91-.64.07-.63.07-.63 1 .08 1.53 1.05 1.53 1.05.89 1.57 2.34 1.12 2.91.86.09-.66.35-1.12.63-1.38-2.22-.26-4.56-1.14-4.56-5.08 0-1.12.39-2.04 1.03-2.76-.1-.26-.45-1.31.1-2.74 0 0 .84-.28 2.75 1.05A9.33 9.33 0 0 1 12 6.84c.85 0 1.71.12 2.51.35 1.91-1.33 2.75-1.05 2.75-1.05.55 1.43.2 2.48.1 2.74.64.72 1.03 1.64 1.03 2.76 0 3.95-2.34 4.82-4.57 5.07.36.32.68.94.68 1.9 0 1.37-.01 2.47-.01 2.81 0 .27.18.6.69.49A10.25 10.25 0 0 0 22 12.23C22 6.58 17.52 2 12 2Z"/>
+          </svg>
+          <span>@roger-casas</span>
+        </div>
       </header>
 
       <button class="overview-button" data-overview-button hidden>Tornar a la vista completa</button>
@@ -823,6 +919,19 @@ function routeStyle(feature, state) {
   };
 }
 
+function routeHitStyle(feature) {
+  const isBus = feature.properties.mode === "bus";
+
+  return {
+    color: isBus ? "#7f8790" : "#0f766e",
+    weight: isBus ? 24 : 28,
+    opacity: 0.01,
+    dashArray: isBus ? "10 10" : "",
+    lineCap: "round",
+    lineJoin: "round"
+  };
+}
+
 function buildSegmentTooltip(feature) {
   return `${feature.properties.label}<br>${feature.properties.mode === "bus" ? "Bus aproximado" : "Trekking"}`;
 }
@@ -863,62 +972,117 @@ function markerClass(kind) {
   return "is-highlight";
 }
 
-function fitBoundsWithUI(map, bounds, mode) {
+function fitBoundsWithUI(map, bounds, mode, options = {}) {
   if (!bounds?.isValid()) {
     return;
   }
+  const { animate = map._loaded } = options;
+  const cameraTarget = resolveCameraTarget(map, bounds, mode);
+  if (!cameraTarget) {
+    return;
+  }
+
+  if (!animate || !map._loaded) {
+    map.setView(cameraTarget.center, cameraTarget.zoom, {
+      animate: false,
+      noMoveStart: true
+    });
+    return;
+  }
+
+  map.stop();
+  map.flyTo(cameraTarget.center, cameraTarget.zoom, cameraTarget.animation);
+}
+
+function resolveCameraTarget(map, bounds, mode) {
   const mobile = window.matchMedia("(max-width: 860px)").matches;
   const isOverview = mode === "overview";
   const isDayMode = mode === "day" || mode === "day-tight";
+  const hasInitialView = map._loaded;
+  const previousCenter = hasInitialView ? map.getCenter() : null;
+  const previousZoom = hasInitialView ? map.getZoom() : null;
 
-  if (mobile && isOverview) {
-    const overviewFit = getMobileOverviewFit(map);
-    map.fitBounds(bounds, {
-      paddingTopLeft: [overviewFit.left, overviewFit.top],
-      paddingBottomRight: [overviewFit.rightPad, overviewFit.bottomPad],
-      maxZoom: 13
+  const restorePreviousView = () => {
+    if (!hasInitialView) {
+      return;
+    }
+    map.setView(previousCenter, previousZoom, {
+      animate: false,
+      noMoveStart: true
     });
-
-    const maxOverviewZoom = Math.min(13, map.getZoom() + 1.5);
-    let bestZoom = map.getZoom();
-
-    for (let nextZoom = bestZoom + 0.25; nextZoom <= maxOverviewZoom + 0.001; nextZoom += 0.25) {
-      map.setZoom(nextZoom, { animate: false });
-      if (boundsFitsSafeArea(map, bounds, overviewFit)) {
-        bestZoom = nextZoom;
-      } else {
-        break;
-      }
-    }
-
-    if (map.getZoom() !== bestZoom) {
-      map.setZoom(bestZoom, { animate: false });
-    }
-    return;
-  }
+  };
 
   const adjustedBounds =
     isOverview
       ? bounds.pad(0)
       : mode === "day-tight"
         ? bounds.pad(mobile ? -0.05 : 0.08)
-      : bounds.pad(mobile ? 0.1 : 0.12);
-  map.fitBounds(adjustedBounds, {
-    paddingTopLeft: mobile ? (isOverview ? [10, 68] : [14, 76]) : [18, 96],
-    paddingBottomRight:
-      isDayMode
-        ? mobile
-          ? [18, 286]
-          : [18, 280]
-        : mobile
-          ? [10, 112]
-          : [18, 150],
-    maxZoom: mobile ? 13 : 14
-  });
+        : bounds.pad(mobile ? 0.1 : 0.12);
+
+  if (mobile && isOverview) {
+    const overviewFit = getMobileOverviewFit(map);
+    map.fitBounds(adjustedBounds, {
+      paddingTopLeft: [overviewFit.left, overviewFit.top],
+      paddingBottomRight: [overviewFit.rightPad, overviewFit.bottomPad],
+      maxZoom: 13,
+      animate: false,
+      noMoveStart: true
+    });
+
+    const maxOverviewZoom = Math.min(13, map.getZoom() + 1.5);
+    let bestZoom = map.getZoom();
+
+    for (let nextZoom = bestZoom + 0.25; nextZoom <= maxOverviewZoom + 0.001; nextZoom += 0.25) {
+      map.setZoom(nextZoom, { animate: false, noMoveStart: true });
+      if (boundsFitsSafeArea(map, adjustedBounds, overviewFit)) {
+        bestZoom = nextZoom;
+      } else {
+        break;
+      }
+    }
+
+    map.setZoom(bestZoom, { animate: false, noMoveStart: true });
+  } else {
+    const framingOptions = {
+      paddingTopLeft: mobile ? (isOverview ? [10, 68] : [14, 76]) : [18, 96],
+      paddingBottomRight:
+        isDayMode
+          ? mobile
+            ? [18, 286]
+            : [18, 280]
+          : mobile
+            ? [10, 112]
+            : [18, 150],
+      maxZoom: mobile ? 13 : 14
+    };
+
+    map.fitBounds(adjustedBounds, {
+      ...framingOptions,
+      animate: false,
+      noMoveStart: true
+    });
+  }
 
   if (!mobile && (isOverview || mode === "day-tight")) {
-    map.setZoom(map.getZoom() - 1, { animate: false });
+    map.setZoom(map.getZoom() - 1, {
+      animate: false,
+      noMoveStart: true
+    });
   }
+
+  const target = {
+    center: map.getCenter(),
+    zoom: map.getZoom(),
+    animation: {
+      animate: hasInitialView,
+      duration: mobile ? 0.58 : 0.78,
+      easeLinearity: 0.18,
+      noMoveStart: true
+    }
+  };
+
+  restorePreviousView();
+  return target;
 }
 
 function getMobileOverviewFit(map) {
@@ -927,14 +1091,14 @@ function getMobileOverviewFit(map) {
   const carouselRect = document.querySelector(".route-carousel-wrap")?.getBoundingClientRect();
   const zoomRect = document.querySelector(".leaflet-control-zoom")?.getBoundingClientRect();
   const carouselHeight = carouselRect ? mapRect.bottom - carouselRect.top : 0;
-  const overlapAllowance = Math.min(56, Math.round(carouselHeight * 0.28));
+  const overlapAllowance = Math.min(92, Math.round(carouselHeight * 0.52));
 
   const left = 10;
-  const top = Math.max(62, Math.round((headerRect?.bottom || mapRect.top) - mapRect.top + 6));
+  const top = Math.max(46, Math.round((headerRect?.bottom || mapRect.top) - mapRect.top + 2));
   const rightPad = Math.max(12, Math.round(mapRect.right - (zoomRect?.left || mapRect.right) + 10));
   const bottomPad = Math.max(
-    88,
-    Math.round(mapRect.bottom - (carouselRect?.top || mapRect.bottom) + 12 - overlapAllowance)
+    42,
+    Math.round(mapRect.bottom - (carouselRect?.top || mapRect.bottom) + 4 - overlapAllowance)
   );
 
   return {
