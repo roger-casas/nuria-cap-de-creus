@@ -1,12 +1,20 @@
 import "leaflet/dist/leaflet.css";
 import "./style.css";
 import L from "leaflet";
+import { gunzipSync, strFromU8 } from "fflate";
 
 const routePromise = Promise.all([
-  fetch("/data/route.geojson").then((response) => response.json()),
+  fetchCompressedJson("/data/route.geojson.gz.b64"),
   fetch("/data/places.geojson").then((response) => response.json()),
   fetch("/data/route-meta.json").then((response) => response.json())
 ]);
+
+async function fetchCompressedJson(url) {
+  const response = await fetch(url);
+  const base64 = (await response.text()).trim();
+  const compressed = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
+  return JSON.parse(strFromU8(gunzipSync(compressed)));
+}
 
 routePromise
   .then(([routeGeoJson, placesGeoJson, meta]) => {
